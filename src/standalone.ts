@@ -37,12 +37,14 @@ import {
   usageFromResponse,
 } from "./transform.js";
 import { configureCodexClient } from "./codex-client.js";
+import { createRateLimitsReader } from "./ratelimits.js";
 import type { CodexEvent, OpenAIChatCompletionsRequest, OpenAIResponsesRequest } from "./types.js";
 
 type ServerOptions = {
   host: string;
   port: number;
   authFile?: string;
+  codexBin?: string;
 };
 
 function readBody(request: http.IncomingMessage): Promise<string> {
@@ -82,6 +84,9 @@ function parseArgs(argv: string[]): ServerOptions {
       index += 1;
     } else if ((arg === "--auth-file" || arg === "-a") && next) {
       options.authFile = next;
+      index += 1;
+    } else if (arg === "--codex-bin" && next) {
+      options.codexBin = next;
       index += 1;
     }
   }
@@ -209,6 +214,11 @@ export async function startStandaloneServer(options: ServerOptions) {
   const validated = validateCodexAuthFile(authFile);
   configureCodexClient({ authFilePath: validated.authPath });
 
+  // Subscription quota comes from the Codex app-server, not from the responses API.
+  // `log` is silent here on purpose: /usage is read on demand, and a noisy engine
+  // would be restarted by the DSH supervisor for nothing.
+  const rateLimits = createRateLimitsReader({ codexBin: options.codexBin });
+
   const server = http.createServer((request, response) => {
     void (async () => {
       try {
@@ -229,6 +239,17 @@ export async function startStandaloneServer(options: ServerOptions) {
             owned_by: "chatgpt-codex",
           }));
           sendJson(response, 200, { object: "list", data: items });
+          return;
+        }
+
+        if (request.method === "GET" && (path === "/usage" || path === "/v1/usage" || path === "/rate-limits")) {
+          try {
+            const fresh = url.searchParams.get("fresh") === "1" || url.searchParams.get("fresh") === "true";
+            sendJson(response, 200, await rateLimits.read(fresh));
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            sendJson(response, 503, { error: { message: `rate limits unavailable: ${message}` } });
+          }
           return;
         }
 
@@ -262,6 +283,7 @@ export async function startStandaloneServer(options: ServerOptions) {
   });
 
   await new Promise<void>((resolve) => server.listen(options.port, options.host, resolve));
+  server.on("close", () => rateLimits.dispose());
 
   return server;
 }
