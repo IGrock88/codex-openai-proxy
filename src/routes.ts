@@ -20,11 +20,17 @@ import {
   buildCodexResponsesRequestFromChatCompletions,
   buildCodexResponsesRequestFromResponses,
   collectTextFromCodexEvents,
+  collectToolCallsFromCodexEvents,
   createChatCompletion,
   createChatCompletionChunk,
   createChatCompletionDoneChunk,
+  createChatCompletionUsageChunk,
   createOpenAIResponsesOutput,
+  createToolCallArgumentsChunk,
+  createToolCallStartChunk,
   normalizeModelName,
+  usageFromCodexEvents,
+  usageFromResponse,
 } from "./transform.js";
 import type { CodexEvent, OpenAIChatCompletionsRequest, OpenAIResponsesRequest } from "./types.js";
 
@@ -97,7 +103,7 @@ export async function registerRoutes(app: FastifyInstance) {
     logIgnoredParameters(
       request.log,
       (request.body ?? {}) as Record<string, unknown>,
-      ["model", "instructions", "input", "stream"],
+      ["model", "instructions", "input", "stream", "tools", "tool_choice", "parallel_tool_calls"],
     );
 
     const body = buildCodexResponsesRequestFromResponses(request.body ?? {});
@@ -136,7 +142,12 @@ export async function registerRoutes(app: FastifyInstance) {
         ? responseIdValue
         : `resp_${Date.now()}`;
 
-    return createOpenAIResponsesOutput(responseId, text);
+    return createOpenAIResponsesOutput(
+      responseId,
+      text,
+      collectToolCallsFromCodexEvents(events),
+      usageFromCodexEvents(events),
+    );
   });
 
   app.post<{ Body: OpenAIChatCompletionsRequest }>(
@@ -145,7 +156,7 @@ export async function registerRoutes(app: FastifyInstance) {
       logIgnoredParameters(
         request.log,
         (request.body ?? {}) as Record<string, unknown>,
-        ["model", "messages", "stream"],
+        ["model", "messages", "stream", "tools", "tool_choice", "parallel_tool_calls"],
       );
 
       const body = buildCodexResponsesRequestFromChatCompletions(request.body ?? {});
@@ -161,13 +172,54 @@ export async function registerRoutes(app: FastifyInstance) {
           Connection: "keep-alive",
         });
 
+        const toolIndexByItem = new Map<string, number>();
+        let toolCount = 0;
+
         try {
           await streamCodexResponseToSSE(body, reply, (event: CodexEvent) => {
+            if (event.type === "response.output_item.added" && event.item?.type === "function_call") {
+              const item = event.item;
+              const itemKey = item?.id ?? item?.call_id ?? "";
+              const index = toolCount++;
+              if (itemKey) toolIndexByItem.set(itemKey, index);
+              writeSSE(
+                reply,
+                createToolCallStartChunk(
+                  responseId,
+                  model,
+                  index,
+                  item?.call_id ?? item?.id ?? `call_${index}`,
+                  item?.name ?? "",
+                ),
+              );
+              return;
+            }
+
+            if (event.type === "response.function_call_arguments.delta") {
+              const index = event.item_id ? toolIndexByItem.get(event.item_id) : undefined;
+              if (index !== undefined) {
+                writeSSE(
+                  reply,
+                  createToolCallArgumentsChunk(responseId, model, index, event.delta ?? ""),
+                );
+              }
+              return;
+            }
+
             if (event.type === "response.output_text.delta" && event.delta) {
               writeSSE(reply, createChatCompletionChunk(responseId, model, event.delta));
+              return;
             }
+
             if (event.type === "response.completed") {
-              writeSSE(reply, createChatCompletionDoneChunk(responseId, model));
+              writeSSE(
+                reply,
+                createChatCompletionDoneChunk(responseId, model, toolCount > 0 ? "tool_calls" : "stop"),
+              );
+              const usage = usageFromResponse(event.response);
+              if (usage) {
+                writeSSE(reply, createChatCompletionUsageChunk(responseId, model, usage));
+              }
             }
           });
 
@@ -192,7 +244,13 @@ export async function registerRoutes(app: FastifyInstance) {
           ? responseIdValue
           : `chatcmpl_${Date.now()}`;
 
-      return createChatCompletion(responseId, model, text);
+      return createChatCompletion(
+        responseId,
+        model,
+        text,
+        collectToolCallsFromCodexEvents(events),
+        usageFromCodexEvents(events),
+      );
     },
   );
 }
