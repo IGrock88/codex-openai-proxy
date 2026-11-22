@@ -181,7 +181,7 @@ class AppServerSession {
     private lastUsedAt = Date.now();
     private idleTimer: NodeJS.Timeout | null = null;
 
-    constructor(private readonly options: Required<Pick<RateLimitsReaderOptions, "requestTimeoutMs" | "idleMs">> & { codexBin: string; log: (message: string) => void }) {}
+    constructor(private readonly options: Required<Pick<RateLimitsReaderOptions, "requestTimeoutMs" | "idleMs">> & { resolveBin: () => string; log: (message: string) => void }) {}
 
     /** One request, opening (and handshaking) the child when it is not running yet. */
     async request(method: string, params: unknown): Promise<unknown> {
@@ -209,7 +209,10 @@ class AppServerSession {
     }
 
     private async start(): Promise<void> {
-        const { codexBin, log } = this.options;
+        // Resolved per start: the desktop app replaces its versioned folder on
+        // update, and this reader outlives such an update.
+        const codexBin = this.options.resolveBin();
+        const { log } = this.options;
         const child = spawn(codexBin, ["app-server", "--stdio"], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
         this.child = child;
         this.buffer = "";
@@ -333,7 +336,7 @@ export function createRateLimitsReader(options: RateLimitsReaderOptions = {}): R
     const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
     const log = options.log ?? (() => {});
     const session = new AppServerSession({
-        codexBin: resolveCodexBin(options.codexBin),
+        resolveBin: () => resolveCodexBin(options.codexBin),
         requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
         idleMs: options.idleMs ?? DEFAULT_IDLE_MS,
         log,
