@@ -53,12 +53,63 @@ export interface RateLimitsReader {
     dispose(): void;
 }
 
-/** Locate the Codex CLI: explicit option, then env, then the usual install paths, then PATH. */
+function compareVersion(left: number[], right: number[]): number {
+    for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+        const a = left[index] ?? 0;
+        const b = right[index] ?? 0;
+        if (a !== b) return a - b;
+    }
+    return 0;
+}
+
+/**
+ * A folder can exist while the Store is still installing it: the binary is there
+ * but held exclusively, and spawning it fails with EBUSY. Only a file we can open
+ * counts as usable.
+ */
+function isLaunchable(bin: string): boolean {
+    try {
+        const handle = fs.openSync(bin, "r");
+        fs.closeSync(handle);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * The Codex desktop app installs each build into its own versioned folder, so the
+ * current binary has to be looked up rather than remembered. Returns the highest
+ * version that has a usable executable, or undefined when the folder is
+ * unreadable (it needs no elevation to list, but may be locked down).
+ */
+function storeCodexBin(): string | undefined {
+    if (process.platform !== "win32") return undefined;
+    const root = "C:\\Program Files\\WindowsApps";
+    let best: { version: number[]; bin: string } | undefined;
+    try {
+        for (const entry of fs.readdirSync(root)) {
+            if (!entry.startsWith("OpenAI.Codex_")) continue;
+            const match = /^OpenAI\.Codex_(\d+)\.(\d+)\.(\d+)\.(\d+)_/.exec(entry);
+            const version = match ? match.slice(1, 5).map(Number) : [0, 0, 0, 0];
+            const bin = path.join(root, entry, "app", "resources", "codex.exe");
+            if (!isLaunchable(bin)) continue;
+            if (!best || compareVersion(version, best.version) > 0) best = { version, bin };
+        }
+    } catch {
+        return undefined;
+    }
+    return best?.bin;
+}
+
+/** Locate the Codex CLI: explicit option, then env, then the desktop app, then the usual install paths, then PATH. */
 export function resolveCodexBin(explicit?: string): string {
     const candidates = [explicit, process.env.CODEX_BIN].filter((value): value is string => typeof value === "string" && value !== "");
     for (const candidate of candidates) return candidate;
     const platform = process.platform;
     const home = os.homedir();
+    const fromStore = storeCodexBin();
+    if (fromStore) return fromStore;
     const known = platform === "win32"
         ? [
             path.join(process.env.LOCALAPPDATA ?? path.join(home, "AppData", "Local"), "Programs", "OpenAI", "Codex", "bin", "codex.exe"),
