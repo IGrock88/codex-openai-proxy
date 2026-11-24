@@ -140,7 +140,7 @@ export function resolveCodexBin(explicit?: string): string {
     for (const candidate of candidates) return candidate;
     const platform = process.platform;
     const home = os.homedir();
-    const fromStore = registeredCodexBin() ?? storeCodexBin();
+    const fromStore = storeCodexBin() ?? registeredCodexBin();
     if (fromStore) return fromStore;
     const known = platform === "win32"
         ? [
