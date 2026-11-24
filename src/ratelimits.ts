@@ -8,7 +8,7 @@
  * a process start every time. The child is killed after an idle period and
  * re-spawned on demand; a crashed child is restarted on the next read.
  */
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -102,13 +102,45 @@ function storeCodexBin(): string | undefined {
     return best?.bin;
 }
 
+/**
+ * Install folder of the newest registered Codex package. `C:\Program Files\
+ * WindowsApps` is readable only to an elevated process, and the embedding Host
+ * may run without elevation, so the per-user Appx registration is asked first.
+ */
+function registeredCodexBin(): string | undefined {
+    if (process.platform !== "win32") return undefined;
+    const script =
+        "$p = @(Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction SilentlyContinue); " +
+        "if ($p.Count -gt 0) { $l = $p[0]; foreach ($c in $p) { if ($c.Version -gt $l.Version) { $l = $c } }; $l.InstallLocation }";
+    const shells = [
+        path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        "powershell.exe",
+    ];
+    for (const shell of shells) {
+        try {
+            const out = execFileSync(shell, ["-NoProfile", "-NonInteractive", "-Command", script], {
+                encoding: "utf8",
+                windowsHide: true,
+                timeout: 20_000,
+            });
+            const location = String(out).trim();
+            if (!location) continue;
+            const bin = path.join(location, "app", "resources", "codex.exe");
+            if (isLaunchable(bin)) return bin;
+        } catch {
+            /* try the next shell, then fall back to the folder scan */
+        }
+    }
+    return undefined;
+}
+
 /** Locate the Codex CLI: explicit option, then env, then the desktop app, then the usual install paths, then PATH. */
 export function resolveCodexBin(explicit?: string): string {
     const candidates = [explicit, process.env.CODEX_BIN].filter((value): value is string => typeof value === "string" && value !== "");
     for (const candidate of candidates) return candidate;
     const platform = process.platform;
     const home = os.homedir();
-    const fromStore = storeCodexBin();
+    const fromStore = registeredCodexBin() ?? storeCodexBin();
     if (fromStore) return fromStore;
     const known = platform === "win32"
         ? [
